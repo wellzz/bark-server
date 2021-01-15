@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,11 +14,10 @@ import (
 	"github.com/lithammer/shortuuid"
 
 	"github.com/go-zoo/bone"
-	bolt "go.etcd.io/bbolt"
 
 	"github.com/sideshow/apns2"
-	"github.com/sideshow/apns2/token"
 	"github.com/sideshow/apns2/payload"
+	"github.com/sideshow/apns2/token"
 )
 
 type BaseResponse struct {
@@ -116,11 +113,35 @@ func index(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func setAlias(key, alias string) error {
+	err := db.Alias(key, alias)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func register(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 	err := r.ParseForm()
 	if err != nil {
 		logrus.Error(err)
+	}
+	oldKey := r.FormValue("key")
+	if alias := r.FormValue("alias"); len(alias) != 0 {
+		err := setAlias(oldKey, alias)
+		if err != nil {
+			_, err = fmt.Fprint(w, responseString(400, err.Error()))
+			if err != nil {
+				logrus.Error(err)
+			}
+		} else {
+			_, err = fmt.Fprint(w, responseData(200, map[string]interface{}{"key": oldKey}, "设置别名成功"))
+			if err != nil {
+				logrus.Error(err)
+			}
+		}
+		return
 	}
 
 	key := shortuuid.New()
@@ -140,23 +161,11 @@ func register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oldKey := r.FormValue("key")
-	err = boltDB.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte("device"))
-		if err != nil {
-			return err
-		}
+	if len(oldKey) > 0 {
+		key = oldKey
+	}
 
-		if len(oldKey) > 0 {
-			//如果已经注册，则更新DeviceToken的值
-			val := bucket.Get([]byte(oldKey))
-			if val != nil {
-				key = oldKey
-			}
-		}
-
-		return bucket.Put([]byte(key), []byte(deviceToken))
-	})
+	newkey, err := db.Set(key, deviceToken)
 
 	if err != nil {
 		_, err = fmt.Fprint(w, responseString(400, "注册设备失败"))
@@ -166,29 +175,16 @@ func register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logrus.Info("注册设备成功")
-	logrus.Info("key: ", key)
+	logrus.Info("key: ", newkey)
 	logrus.Info("deviceToken: ", deviceToken)
-	_, err = fmt.Fprint(w, responseData(200, map[string]interface{}{"key": key}, "注册成功"))
+	_, err = fmt.Fprint(w, responseData(200, map[string]interface{}{"key": newkey}, "注册成功"))
 	if err != nil {
 		logrus.Error(err)
 	}
 }
 
 func getDeviceTokenByKey(key string) (string, error) {
-	var deviceTokenBytes []byte
-	err := boltDB.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("device"))
-		deviceTokenBytes = bucket.Get([]byte(key))
-		if deviceTokenBytes == nil {
-			return errors.New("没找到 DeviceToken")
-		}
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return string(deviceTokenBytes), nil
+	return db.Get(key)
 }
 
 func getb() []byte {
@@ -241,7 +237,7 @@ func postPush(category string, title string, body string, deviceToken string, pa
 
 }
 
-var boltDB *bolt.DB
+var db *DB
 var apnsClient *apns2.Client
 
 func runBarkServer() {
@@ -256,32 +252,17 @@ func runBarkServer() {
 	//
 	//fmt.Printf(string(t))
 
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		if err = os.Mkdir(dataDir, 0755); err != nil {
-			logrus.Fatal(err)
-		}
-	} else if err != nil {
-		logrus.Fatal(err)
-	}
-
-	db, err := bolt.Open(filepath.Join(dataDir, "bark.db"), 0600, nil)
+	mongoDB, err := NewDB()
 	if err != nil {
-		logrus.Fatal(err)
+		logrus.Fatal("connect db failed, err", err)
 	}
 	defer func() { _ = db.Close() }()
-	boltDB = db
 
-	err = boltDB.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte("device"))
-		return err
-	})
-	if err != nil {
-		logrus.Fatal(err)
-	}
+	db = mongoDB
 
 	authKey, err := token.AuthKeyFromBytes(getb())
 	if err != nil {
-		logrus.Fatalf("token error:", err)
+		logrus.Fatal("token error:", err)
 	}
 	clientToken := &token.Token{
 		AuthKey: authKey,
@@ -289,12 +270,12 @@ func runBarkServer() {
 		TeamID:  "5U8LBRXG3A",
 	}
 
-	apnsClient = apns2.NewTokenClient(clientToken).Production()
+	apnsClient = apns2.NewTokenClient(clientToken, true).Production()
 
 	addr := fmt.Sprint(listenAddr, ":", listenPort)
 	logrus.Info("Serving HTTP on " + addr)
 
-	r := bone.New()
+	r := bone.New().Prefix("/api")
 	r.Get("/ping", http.HandlerFunc(ping))
 	r.Post("/ping", http.HandlerFunc(ping))
 

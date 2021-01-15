@@ -1,10 +1,11 @@
 package main
 
 import (
-	"net"
-
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"net"
+	"os"
+	"strconv"
 )
 
 var listenAddr net.IP
@@ -27,7 +28,10 @@ Bark Server.`,
 		if debug {
 			logrus.SetLevel(logrus.DebugLevel)
 		}
-
+		if val, ok := os.LookupEnv("FUNCTIONS_CUSTOMHANDLER_PORT"); ok {
+			logrus.Info("rewrite listen port:", val)
+			listenPort, _ = strconv.Atoi(val)
+		}
 		runBarkServer()
 	},
 }
